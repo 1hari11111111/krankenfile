@@ -24,8 +24,8 @@ heroku create kraken-leech-bot
 
 ### 3. Set Config Vars (your secrets)
 ```bash
-heroku config:set BOT_TOKEN=8938744418:AAER35y5SCJvo_xt8HDbJ4dGexl2XENcFns
-heroku config:set KRAKEN_API_KEY=OThkNDdjZTViMDE5MmI4YQqJEz6_-H1KPbvWrRxlm1rzDQYt8n1itkSy7BPNcdeY
+heroku config:set BOT_TOKEN=8938744418:AAER35y5SCJvo
+heroku config:set KRAKEN_API_KEY=OThkNDdjZTViMDE5MmI4YQqJEz6
 ```
 > ⚠️ Regenerate your KrakenFiles API key after deploy for security!
 
