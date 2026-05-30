@@ -1,21 +1,21 @@
 """
-KrakenFiles Leech Bot
-======================
-Telegram bot that leeches files from krakenfiles.com using their official API.
+KrakenFiles Leech Bot (v2 - No Auth Required)
+===============================================
+Works on ANY krakenfiles.com link - not just your own files.
+Uses public scraping + public download token endpoint.
 
 Commands:
   /start        - Welcome message
-  /leech <url>  - Download file from KrakenFiles & send to Telegram
-  /info <url>   - Get file info without downloading
-  /help         - Show help
-
-Author: Built for Heroku deployment
+  /leech <url>  - Download & send file
+  /info <url>   - File info only
+  /help         - Help
 """
 
 import os
 import re
 import logging
 import requests
+from bs4 import BeautifulSoup
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -26,133 +26,196 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 
-# ── Config (loaded from Heroku environment variables) ─────────────────────────
-BOT_TOKEN     = os.environ.get("BOT_TOKEN", "")
-KRAKEN_API_KEY = os.environ.get("KRAKEN_API_KEY", "")
+# ── Config ─────────────────────────────────────────────────────────────────
+BOT_TOKEN      = os.environ.get("BOT_TOKEN", "")
+MAX_FILE_SIZE_MB = 50
+CHUNK_SIZE       = 512 * 1024  # 512 KB
 
-MAX_FILE_SIZE_MB = 50       # Telegram Bot API hard limit
-CHUNK_SIZE       = 1024 * 512  # 512 KB stream chunks
-REQUEST_TIMEOUT  = 30
-
-# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-# ── KrakenFiles URL pattern ───────────────────────────────────────────────────
 # Matches: https://krakenfiles.com/view/HASH/file.html
 KRAKEN_PATTERN = re.compile(
     r"https?://krakenfiles\.com/(?:view|file)/([a-zA-Z0-9_-]+)(?:/file\.html)?"
 )
 
-# ── KrakenFiles API ───────────────────────────────────────────────────────────
-
-BASE_URL = "https://krakenfiles.com/api"
-HEADERS  = {
-    "AuthToken": KRAKEN_API_KEY,
-    "Content-Type": "application/json",
-    "User-Agent": "KrakenLeechBot/1.0",
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
 }
 
+# ── Helpers ─────────────────────────────────────────────────────────────────
 
 def extract_hash(url: str) -> str | None:
-    """Extract the file hash from a KrakenFiles URL."""
     match = KRAKEN_PATTERN.search(url.strip())
     return match.group(1) if match else None
 
 
-def api_get_file_info(file_hash: str) -> dict:
+def scrape_file_info(file_hash: str) -> dict:
     """
-    GET /api/file/{hash}/info
-    Returns file metadata: name, size, etc.
+    Scrape file info from the krakenfiles view page.
+    Extracts: filename, size, server_filename (used for download).
     """
     try:
-        r = requests.get(
-            f"{BASE_URL}/file/{file_hash}/info",
-            headers=HEADERS,
-            timeout=REQUEST_TIMEOUT,
-        )
+        url = f"https://krakenfiles.com/view/{file_hash}/file.html"
+        r = requests.get(url, headers=HEADERS, timeout=20)
+
         if r.status_code == 404:
             return {"ok": False, "error": "❌ File not found. It may have been deleted."}
-        if r.status_code == 401:
-            return {"ok": False, "error": "❌ Invalid API key. Check KRAKEN_API_KEY config var."}
         if r.status_code != 200:
-            return {"ok": False, "error": f"❌ KrakenFiles API error: HTTP {r.status_code}"}
+            return {"ok": False, "error": f"❌ HTTP {r.status_code} from KrakenFiles."}
 
-        data = r.json()
-        # API returns: {"status": "ok", "data": {"title": ..., "size": ..., ...}}
-        if data.get("status") != "ok":
-            return {"ok": False, "error": f"❌ API returned: {data.get('message', 'Unknown error')}"}
+        soup = BeautifulSoup(r.text, "html.parser")
 
-        info = data["data"]
-        size_bytes = int(info.get("size", 0))
-        size_mb = round(size_bytes / (1024 * 1024), 2)
+        # Filename — in <h4> or <title> or meta
+        filename = None
+        h4 = soup.find("h4", {"class": re.compile("title|name|file", re.I)})
+        if h4:
+            filename = h4.get_text(strip=True)
+        if not filename:
+            title = soup.find("title")
+            if title:
+                # Title usually: "Download filename - KrakenFiles"
+                filename = title.get_text(strip=True).split(" - ")[0].replace("Download ", "").strip()
+        if not filename:
+            filename = f"{file_hash}.file"
+
+        # Size — look for text like "26.5 MB"
+        size_mb = 0
+        size_text = ""
+        for tag in soup.find_all(string=re.compile(r"\d+\.?\d*\s*(MB|GB|KB)", re.I)):
+            size_text = tag.strip()
+            match = re.search(r"([\d.]+)\s*(MB|GB|KB)", size_text, re.I)
+            if match:
+                val, unit = float(match.group(1)), match.group(2).upper()
+                if unit == "KB": size_mb = round(val / 1024, 2)
+                elif unit == "MB": size_mb = round(val, 2)
+                elif unit == "GB": size_mb = round(val * 1024, 2)
+                break
+
+        # Server filename — hidden input used for download token
+        server_filename = None
+        inp = soup.find("input", {"id": re.compile("server.?file.?name|sname", re.I)})
+        if inp:
+            server_filename = inp.get("value")
+
+        # Also grab any hidden form fields for token request
+        form_data = {}
+        form = soup.find("form", {"id": re.compile("download|dl", re.I)})
+        if form:
+            for inp in form.find_all("input", {"type": "hidden"}):
+                if inp.get("name") and inp.get("value"):
+                    form_data[inp["name"]] = inp["value"]
 
         return {
             "ok": True,
             "hash": file_hash,
-            "filename": info.get("title", "unknown_file"),
-            "size_bytes": size_bytes,
+            "filename": filename,
             "size_mb": size_mb,
-            "downloads": info.get("downloads", "N/A"),
-            "created": info.get("created_at", "N/A"),
+            "server_filename": server_filename,
+            "form_data": form_data,
+            "page_url": url,
         }
 
     except requests.exceptions.Timeout:
-        return {"ok": False, "error": "❌ Request timed out. KrakenFiles may be slow."}
+        return {"ok": False, "error": "❌ Request timed out."}
     except requests.exceptions.ConnectionError:
         return {"ok": False, "error": "❌ Cannot connect to krakenfiles.com."}
     except Exception as e:
-        return {"ok": False, "error": f"❌ Unexpected error: {e}"}
+        return {"ok": False, "error": f"❌ Scrape error: {e}"}
 
 
-def api_get_download_token(file_hash: str) -> dict:
+def get_download_url(info: dict) -> dict:
     """
-    POST /api/file/{hash}/download-token
-    Returns a one-time download token.
+    POST to the public token endpoint to get direct download URL.
+    KrakenFiles public endpoint: POST /api/file/{hash}/download-token
+    No auth required for public files.
     """
+    file_hash = info["hash"]
+
     try:
+        # Method 1: Public API token (no auth needed for public files)
+        api_headers = {
+            "User-Agent": HEADERS["User-Agent"],
+            "Content-Type": "application/json",
+            "Referer": f"https://krakenfiles.com/view/{file_hash}/file.html",
+            "Origin": "https://krakenfiles.com",
+        }
+
         r = requests.post(
-            f"{BASE_URL}/file/{file_hash}/download-token",
-            headers=HEADERS,
-            timeout=REQUEST_TIMEOUT,
+            f"https://krakenfiles.com/api/file/{file_hash}/download-token",
+            headers=api_headers,
+            json={},
+            timeout=20,
         )
-        if r.status_code == 401:
-            return {"ok": False, "error": "❌ Invalid API key."}
-        if r.status_code == 404:
-            return {"ok": False, "error": "❌ File not found."}
-        if r.status_code != 200:
-            return {"ok": False, "error": f"❌ Token request failed: HTTP {r.status_code}"}
 
-        data = r.json()
-        if data.get("status") != "ok":
-            return {"ok": False, "error": f"❌ {data.get('message', 'Token error')}"}
+        logger.info(f"Token API response: {r.status_code} — {r.text[:200]}")
 
-        token = data["data"].get("token")
-        if not token:
-            return {"ok": False, "error": "❌ No token in API response."}
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("status") == "ok":
+                token = data["data"].get("token")
+                if token:
+                    dl_url = f"https://krakenfiles.com/download/{file_hash}?token={token}"
+                    return {"ok": True, "download_url": dl_url}
 
-        # Direct download URL
-        download_url = f"https://krakenfiles.com/download/{file_hash}?token={token}"
-        return {"ok": True, "token": token, "download_url": download_url}
+        # Method 2: Try form-based download (older fallback)
+        if info.get("form_data"):
+            form_headers = {
+                **HEADERS,
+                "Referer": info["page_url"],
+                "Origin": "https://krakenfiles.com",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "X-Requested-With": "XMLHttpRequest",
+            }
+            r2 = requests.post(
+                f"https://krakenfiles.com/download/{file_hash}",
+                headers=form_headers,
+                data=info["form_data"],
+                timeout=20,
+            )
+            logger.info(f"Form download response: {r2.status_code} — {r2.text[:200]}")
+
+            if r2.status_code == 200:
+                try:
+                    d2 = r2.json()
+                    url = d2.get("url") or d2.get("download_url") or d2.get("data", {}).get("url")
+                    if url:
+                        return {"ok": True, "download_url": url}
+                except Exception:
+                    pass
+
+        return {"ok": False, "error": f"❌ Could not get download token. API said: {r.text[:100]}"}
 
     except Exception as e:
         return {"ok": False, "error": f"❌ Token error: {e}"}
 
 
-def download_file(download_url: str, dest_path: str, progress_cb=None) -> dict:
-    """Stream download a file to dest_path."""
+def stream_download(download_url: str, dest_path: str, progress_cb=None) -> dict:
+    """Stream download file to disk."""
     try:
         r = requests.get(
             download_url,
+            headers=HEADERS,
             stream=True,
             timeout=120,
-            headers={"User-Agent": "KrakenLeechBot/1.0"},
+            allow_redirects=True,
         )
         if r.status_code != 200:
             return {"ok": False, "error": f"❌ Download failed: HTTP {r.status_code}"}
+
+        # Try to get real filename from Content-Disposition
+        real_filename = None
+        cd = r.headers.get("Content-Disposition", "")
+        m = re.search(r'filename[^;=\n]*=(["\']?)([^\n;"\']+)\1', cd)
+        if m:
+            real_filename = m.group(2).strip()
 
         total = int(r.headers.get("Content-Length", 0))
         downloaded = 0
@@ -169,7 +232,7 @@ def download_file(download_url: str, dest_path: str, progress_cb=None) -> dict:
                             progress_cb(downloaded, total)
                             last_pct = pct
 
-        return {"ok": True, "size_bytes": downloaded}
+        return {"ok": True, "size_bytes": downloaded, "real_filename": real_filename}
 
     except requests.exceptions.Timeout:
         return {"ok": False, "error": "❌ Download timed out."}
@@ -177,18 +240,18 @@ def download_file(download_url: str, dest_path: str, progress_cb=None) -> dict:
         return {"ok": False, "error": f"❌ Download error: {e}"}
 
 
-# ── Telegram Handlers ─────────────────────────────────────────────────────────
+# ── Telegram Handlers ────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "🐙 *KrakenFiles Leech Bot*\n\n"
-        "Send me any KrakenFiles link and I'll download and deliver the file straight to Telegram!\n\n"
+        "Send me *any* KrakenFiles link — I'll download and send the file to Telegram!\n\n"
         "*Commands:*\n"
         "`/leech <url>` — Download & send file\n"
-        "`/info <url>` — File info without downloading\n"
+        "`/info <url>` — File info only\n"
         "`/help` — Show this message\n\n"
-        "*Supported URL format:*\n"
-        "`https://krakenfiles.com/view/HASH/file.html`\n\n"
+        "*Example:*\n"
+        "`/leech https://krakenfiles.com/view/Ir6jgunBI7/file.html`\n\n"
         f"⚠️ Max file size: *{MAX_FILE_SIZE_MB} MB*"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
@@ -209,11 +272,11 @@ async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = context.args[0]
     file_hash = extract_hash(url)
     if not file_hash:
-        await update.message.reply_text("❌ Invalid KrakenFiles URL.", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("❌ Invalid KrakenFiles URL.")
         return
 
     msg = await update.message.reply_text("🔍 Fetching file info...")
-    info = api_get_file_info(file_hash)
+    info = scrape_file_info(file_hash)
 
     if not info["ok"]:
         await msg.edit_text(info["error"])
@@ -223,8 +286,6 @@ async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📄 *File Info*\n\n"
         f"📝 *Name:* `{info['filename']}`\n"
         f"📦 *Size:* `{info['size_mb']} MB`\n"
-        f"⬇️ *Downloads:* `{info['downloads']}`\n"
-        f"📅 *Uploaded:* `{info['created']}`\n"
         f"🔗 *Hash:* `{info['hash']}`"
     )
     await msg.edit_text(text, parse_mode=ParseMode.MARKDOWN)
@@ -241,12 +302,12 @@ async def cmd_leech(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = context.args[0]
     file_hash = extract_hash(url)
     if not file_hash:
-        await update.message.reply_text("❌ Invalid KrakenFiles URL.", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("❌ Invalid KrakenFiles URL.")
         return
 
-    # Step 1: File info
-    msg = await update.message.reply_text("🔍 Checking file on KrakenFiles...")
-    info = api_get_file_info(file_hash)
+    # Step 1: Scrape page info
+    msg = await update.message.reply_text("🔍 Scanning KrakenFiles page...")
+    info = scrape_file_info(file_hash)
     if not info["ok"]:
         await msg.edit_text(info["error"])
         return
@@ -254,36 +315,34 @@ async def cmd_leech(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Step 2: Size check
     if info["size_mb"] > MAX_FILE_SIZE_MB:
         await msg.edit_text(
-            f"❌ *File too large!*\n\n"
-            f"📦 Size: `{info['size_mb']} MB`\n"
-            f"🚫 Limit: `{MAX_FILE_SIZE_MB} MB`\n\n"
-            f"You can download it directly:\n"
-            f"`https://krakenfiles.com/view/{file_hash}/file.html`",
+            f"❌ *File too large!*\n"
+            f"📦 Size: `{info['size_mb']} MB` (limit: {MAX_FILE_SIZE_MB} MB)\n\n"
+            f"Direct link:\n`https://krakenfiles.com/view/{file_hash}/file.html`",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
 
     await msg.edit_text(
-        f"🎯 *Found:* `{info['filename']}`\n"
-        f"📦 Size: `{info['size_mb']} MB`\n\n"
-        f"⏳ Getting download token...",
+        f"✅ *Found:* `{info['filename']}`\n"
+        f"📦 Size: `{info['size_mb']} MB`\n"
+        f"⏳ Getting download link...",
         parse_mode=ParseMode.MARKDOWN,
     )
 
-    # Step 3: Get download token
-    token_result = api_get_download_token(file_hash)
+    # Step 3: Get download URL
+    token_result = get_download_url(info)
     if not token_result["ok"]:
         await msg.edit_text(token_result["error"])
         return
 
     download_url = token_result["download_url"]
     await msg.edit_text(
-        f"⬇️ Downloading `{info['filename']}`\n"
-        f"📦 `{info['size_mb']} MB` — Please wait...",
+        f"⬇️ Downloading `{info['filename']}`...\n"
+        f"📦 `{info['size_mb']} MB` — Please wait ⏳",
         parse_mode=ParseMode.MARKDOWN,
     )
 
-    # Step 4: Download file
+    # Step 4: Stream download
     tmp_path = f"/tmp/{info['filename']}"
 
     def on_progress(downloaded, total):
@@ -298,47 +357,46 @@ async def cmd_leech(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         )
 
-    result = download_file(download_url, tmp_path, on_progress)
+    result = stream_download(download_url, tmp_path, on_progress)
     if not result["ok"]:
         await msg.edit_text(result["error"])
         return
 
+    # Use real filename from server if available
+    final_filename = result.get("real_filename") or info["filename"]
+    size_mb = round(result["size_bytes"] / 1024 / 1024, 2)
+
     # Step 5: Upload to Telegram
-    await msg.edit_text(
-        f"📤 Uploading `{info['filename']}` to Telegram...",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    await msg.edit_text(f"📤 Uploading `{final_filename}` to Telegram...")
 
     try:
         with open(tmp_path, "rb") as f:
             await update.message.reply_document(
                 document=f,
-                filename=info["filename"],
+                filename=final_filename,
                 caption=(
-                    f"✅ *{info['filename']}*\n"
-                    f"📦 `{info['size_mb']} MB`\n"
+                    f"✅ *{final_filename}*\n"
+                    f"📦 `{size_mb} MB`\n"
                     f"🐙 Leeched from KrakenFiles"
                 ),
                 parse_mode=ParseMode.MARKDOWN,
             )
         await msg.delete()
-        logger.info(f"Successfully leeched: {info['filename']} ({info['size_mb']} MB)")
+        logger.info(f"✅ Leeched: {final_filename} ({size_mb} MB)")
 
     except Exception as e:
         logger.error(f"Upload failed: {e}")
         await msg.edit_text(
-            f"❌ Upload to Telegram failed: `{e}`\n\n"
-            f"Direct link:\n`{download_url}`",
+            f"❌ Telegram upload failed: `{e}`",
             parse_mode=ParseMode.MARKDOWN,
         )
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
-            logger.info(f"Cleaned up temp file: {tmp_path}")
 
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Auto-detect KrakenFiles URLs sent as plain messages."""
+    """Auto-detect KrakenFiles URLs in plain messages."""
     text = update.message.text or ""
     match = KRAKEN_PATTERN.search(text)
     if match:
@@ -346,18 +404,14 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cmd_leech(update, context)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     if not BOT_TOKEN:
-        logger.error("BOT_TOKEN not set! Add it to Heroku Config Vars.")
-        return
-    if not KRAKEN_API_KEY:
-        logger.error("KRAKEN_API_KEY not set! Add it to Heroku Config Vars.")
+        logger.error("❌ BOT_TOKEN not set! Add to Heroku Config Vars.")
         return
 
-    logger.info("🐙 KrakenFiles Leech Bot starting...")
-
+    logger.info("🐙 KrakenFiles Leech Bot v2 starting...")
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
@@ -366,7 +420,7 @@ def main():
     app.add_handler(CommandHandler("leech", cmd_leech))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
 
-    logger.info("✅ Bot is running! Press Ctrl+C to stop.")
+    logger.info("✅ Bot is running!")
     app.run_polling(drop_pending_updates=True)
 
 
